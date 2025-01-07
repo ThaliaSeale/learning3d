@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from .pooling import Pooling
 
 class PCN(torch.nn.Module):
-	def __init__(self, emb_dims=1024, input_shape="bnc", num_coarse=1024, grid_size=4, detailed_output=False):
+	def __init__(self, emb_dims=1024, input_shape="bnc", num_coarse=1024, grid_size=4, detailed_output=False, device='cuda:0', n_channels = 3):
 		# emb_dims:			Embedding Dimensions for PCN.
 		# input_shape:		Shape of Input Point Cloud (b: batch, n: no of points, c: channels)
 		super(PCN, self).__init__()
@@ -19,13 +19,21 @@ class PCN(torch.nn.Module):
 		self.grid_size = grid_size
 		self.num_fine = self.grid_size ** 2 * self.num_coarse
 		self.pooling = Pooling('max')
+		self.n_channels = n_channels
 
 		self.encoder()
 		self.decoder_layers = self.decoder()
 		if detailed_output: self.folding_layers = self.folding()
 
+		# Grid for folding operation
+		linspace = torch.linspace(-0.05, 0.05, steps=self.grid_size)
+		grid = torch.meshgrid(linspace, linspace)
+		grid = torch.reshape(torch.stack(grid, dim=2), (-1,2))								# 16x2
+		grid = torch.unsqueeze(grid, dim=0)													# 1x16x2
+		self.grid = grid.to(device)
+
 	def encoder_1(self):
-		self.conv1 = torch.nn.Conv1d(3, 128, 1)
+		self.conv1 = torch.nn.Conv1d(self.n_channels, 128, 1)
 		self.conv2 = torch.nn.Conv1d(128, 256, 1)
 		self.relu = torch.nn.ReLU()
 
@@ -55,7 +63,7 @@ class PCN(torch.nn.Module):
 	def decoder(self):
 		self.linear1 = torch.nn.Linear(self.emb_dims, 1024)
 		self.linear2 = torch.nn.Linear(1024, 1024)
-		self.linear3 = torch.nn.Linear(1024, self.num_coarse*3)
+		self.linear3 = torch.nn.Linear(1024, self.num_coarse*self.n_channels)
 
 		# self.bn1 = torch.nn.BatchNorm1d(1024)
 		# self.bn2 = torch.nn.BatchNorm1d(1024)
@@ -68,9 +76,9 @@ class PCN(torch.nn.Module):
 		return layers
 
 	def folding(self):
-		self.conv5 = torch.nn.Conv1d(1029, 512, 1)
+		self.conv5 = torch.nn.Conv1d(self.emb_dims + self.n_channels + 2, 512, 1)
 		self.conv6 = torch.nn.Conv1d(512, 512, 1)
-		self.conv7 = torch.nn.Conv1d(512, 3, 1)
+		self.conv7 = torch.nn.Conv1d(512, self.n_channels, 1)
 
 		# self.bn5 = torch.nn.BatchNorm1d(512)
 		# self.bn6 = torch.nn.BatchNorm1d(512)
@@ -83,15 +91,11 @@ class PCN(torch.nn.Module):
 
 	def fine_decoder(self):
 		# Fine Output
-		linspace = torch.linspace(-0.05, 0.05, steps=self.grid_size)
-		grid = torch.meshgrid(linspace, linspace)
-		grid = torch.reshape(torch.stack(grid, dim=2), (-1,2))								# 16x2
-		grid = torch.unsqueeze(grid, dim=0)													# 1x16x2
-		grid_feature = grid.repeat([self.coarse_output.shape[0], self.num_coarse, 1])		# Bx16384x2
+		grid_feature = self.grid.repeat([self.coarse_output.shape[0], self.num_coarse, 1])		# Bx16384x2
 
 		point_feature = torch.unsqueeze(self.coarse_output, dim=2)							# Bx1024x1x3
 		point_feature = point_feature.repeat([1, 1, self.grid_size ** 2, 1])				# Bx1024x16x3
-		point_feature = torch.reshape(point_feature, (-1, self.num_fine, 3))				# Bx16384x3
+		point_feature = torch.reshape(point_feature, (-1, self.num_fine, self.n_channels))				# Bx16384x3
 
 		global_feature = torch.unsqueeze(self.global_feature_v, dim=1)						# Bx1x1024
 		global_feature = global_feature.repeat([1, self.num_fine, 1])						# Bx16384x1024
@@ -100,7 +104,7 @@ class PCN(torch.nn.Module):
 
 		center = torch.unsqueeze(self.coarse_output, dim=2)									# Bx1024x1x3
 		center = center.repeat([1, 1, self.grid_size ** 2, 1])								# Bx1024x16x3
-		center = torch.reshape(center, [-1, self.num_fine, 3])								# Bx16384x3
+		center = torch.reshape(center, [-1, self.num_fine, self.n_channels])								# Bx16384x3
 
 		output = feature.permute(0, 2, 1)
 		for idx, layer in enumerate(self.folding_layers):
@@ -109,6 +113,14 @@ class PCN(torch.nn.Module):
 		return fine_output
 
 	def encode(self, input_data):
+		# input_data: 		Point Cloud having shape input_shape.
+		# output:			PointNet features (Batch x emb_dims)
+		if self.input_shape == "bnc":
+			self.num_points = input_data.shape[1]
+			input_data = input_data.permute(0, 2, 1)
+		else:
+			self.num_points = input_data.shape[2]
+
 		output = input_data
 		for idx, layer in enumerate(self.encoder_layers1):
 			output = layer(output)
@@ -124,31 +136,28 @@ class PCN(torch.nn.Module):
 
 		self.global_feature_v = self.pooling(output)
 
+		return self.global_feature_v
+
 	def decode(self):
 		output = self.global_feature_v
 		for idx, layer in enumerate(self.decoder_layers):
 			output = layer(output)		
-		self.coarse_output = output.view(self.global_feature_v.shape[0], self.num_coarse, 3)
-
-	def forward(self, input_data):
-		# input_data: 		Point Cloud having shape input_shape.
-		# output:			PointNet features (Batch x emb_dims)
-		if self.input_shape == "bnc":
-			self.num_points = input_data.shape[1]
-			input_data = input_data.permute(0, 2, 1)
-		else:
-			self.num_points = input_data.shape[2]
-		if input_data.shape[1] != 3:
-			raise RuntimeError("shape of x must be of [Batch x 3 x NumInPoints]")
-
-		self.encode(input_data)
-		self.decode()
-
+		self.coarse_output = output.view(self.global_feature_v.shape[0], self.num_coarse, self.n_channels)
+		
 		result = {'coarse_output': self.coarse_output}
 
 		if self.detailed_output: 
 			fine_output = self.fine_decoder()
 			result['fine_output'] = fine_output
+
+		return result
+
+
+
+	def forward(self, input_data):
+
+		self.encode(input_data)
+		result = self.decode()
 
 		return result
 
